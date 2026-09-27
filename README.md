@@ -11,7 +11,7 @@
 ## 1. 快速开始
 
 ```bash
-# 构建并运行全部测试（53 个，含并发/失败收敛/挂起恢复场景）
+# 构建并运行全部测试（57 个，含并发/失败收敛/挂起恢复场景）
 mvn test
 
 # 启动服务（默认写入演示数据）
@@ -88,8 +88,11 @@ PENDING ──► PROVISIONING ──► READY
                    READY ────┘
 
 READY ──► SUSPENDING ──► SUSPENDED ──► RESUMING ──► READY
-                             │
-                             └──► RELEASING ──► RELEASED（挂起中到期/保留超限照常回收）
+               │              │            │
+               │              └────────────┴──► RELEASING ──► RELEASED
+               │                                （挂起中到期/保留超限照常回收；
+               └──────────────────────────────►  挂起/恢复卡在中间态期间到期，
+                                                重启收敛确定性转为回收）
 ```
 
 - 合法转换仅为：`PENDING→PROVISIONING→READY|FAILED`、`READY|FAILED→RELEASING→RELEASED`、
@@ -106,15 +109,24 @@ READY ──► SUSPENDING ──► SUSPENDED ──► RESUMING ──► READ
 - **申请**：同租户同名 + 同参数（owner/templateVersion/ttl/资源规格指纹一致）重复申请，
   返回同一个环境，不重复分配资源、不重复占配额；同名但参数不同 → `NAME_CONFLICT`。
 - **回收**：对已 `RELEASED` 的环境重复回收返回同一终态，不报错、不重复释放资源/配额。
-- **挂起**：对已 `SUSPENDED` 的环境重复挂起返回当前表示，不重复释放资源/配额。
+- **挂起**：对仍有效（未到期、未超过最长保留）的 `SUSPENDED` 环境重复挂起返回当前表示，
+  不重复释放资源/配额；若该环境此刻已到期或超过最长保留，则不返回成功表示，而是
+  先完成回收再以 `INVALID_STATE` 拒绝（见 2.3/2.4）。
 - **恢复**：对已 `READY` 的环境重复恢复返回当前表示，不重复占用配额/分配资源。
 
 ### 2.3 挂起与恢复
 
-- **挂起（suspend）**：仅 `READY` 可挂起。挂起释放该环境的全部后端计算资源并**归还配额**
-  （CPU/内存/环境数槽位立即可以被同租户其他环境使用），但环境本身仍然存在：
-  名称、归属、身份与**已固化的配置快照**（含掩码后的非敏感视图）保持可查询，
-  敏感值仍隔离存放、仅 READY 时可经 `/secret` 读取。
+- **挂起（suspend）**：仅 `READY` 可挂起。挂起在租户锁内先做有效期判定，再释放该环境的
+  全部后端计算资源并**归还配额**（CPU/内存/环境数槽位立即可以被同租户其他环境使用），
+  但环境本身仍然存在：名称、归属、身份与**已固化的配置快照**（含掩码后的非敏感视图）
+  保持可查询，敏感值仍隔离存放、仅 READY 时可经 `/secret` 读取。
+  - **环境已过期时再挂起**：只要 `now >= expiresAtMillis`，即便后台到期扫描还没来得及
+    处理它（仓库里看起来仍是 `READY`），挂起也不会成功——在同一临界区内先把回收做完，
+    再以 `INVALID_STATE`（HTTP 409，消息含 *already expired and has been released*）
+    明确拒绝。**绝不会出现“挂起成功、随后又被到期回收”的自相矛盾结果**，调用方也不会
+    误以为可以一直留着它。这与续期、恢复遇到“已过期”时的处理完全一致。
+  - **挂起释放中途失败**：环境停在可查询的 `SUSPENDING`（带 `failureReason`），
+    配额不提前归还（避免“资源没放干净、配额却先还了”），可重试并由收敛器安全推进。
 - **恢复（resume）**：仅 `SUSPENDED` 可恢复。恢复在租户锁内按顺序做确定性判定：
   1. 已到期或超过挂起最长保留时间 → 先完成回收再以 `INVALID_STATE` 明确拒绝；
   2. 配额不足 → 以 `QUOTA_EXCEEDED` 明确拒绝，**环境稳定停在 `SUSPENDED`**，可稍后重试，
@@ -131,11 +143,19 @@ READY ──► SUSPENDING ──► SUSPENDED ──► RESUMING ──► READ
 - 每个环境有 `expiresAtMillis`；`READY` 与 `SUSPENDED` 都参与到期判定（挂起不免回收）。
 - 同租户的所有写操作（申请/续期/挂起/恢复/回收/到期回收）都在同一把**租户锁**内串行。
 - “到期判定 + 回收”在锁内基于仓库最新状态完成：
-  - 到期前发生续期/恢复 → 续期/恢复成功，后到的扫描看到最新状态并跳过
-    （**不会恢复成功又被回收**）；
-  - 已到期发生续期/恢复 → 先完成回收，续期/恢复得到 `INVALID_STATE`，环境保持
-    `RELEASED`（**不会复活**）；
-  - 恢复卡在 `RESUMING` 期间到期 → 收敛器确定性地把它转为回收，而不是恢复成 READY。
+  - 到期前发生续期/挂起/恢复 → 操作成功，后到的扫描看到最新状态并跳过
+    （**不会操作成功又被回收**；挂起成功后环境按其到期时间正常参与后续到期回收，
+    挂起本身不免回收）；
+  - 已到期发生续期/挂起/恢复 → 先完成回收，操作得到 `INVALID_STATE`，环境保持
+    `RELEASED`（**不会复活、也不会挂起成功后被回收**）；
+  - 恢复卡在 `RESUMING`、或挂起卡在 `SUSPENDING` 期间到期 → 收敛器确定性地把它转为
+    回收，而不是推进成 READY/SUSPENDED。
+- **挂起与到期回收并发的确定性**：两者都先抢同一把租户锁，再在锁内基于仓库最新状态判定，
+  因此同一环境上结果唯一——
+  - 抢锁时未到期 → 挂起成立（`SUSPENDED`，资源与配额已让出），扫描线程在锁内看到
+    未到期而跳过；
+  - 抢锁时已到期 → 回收成立（`RELEASED`），挂起线程拿到 `INVALID_STATE` 拒绝；
+    回收恰好发生一次，不存在“一边挂起成功、一边被回收”，也不存在资源与配额对不上的半更新。
 - 到期扫描器默认关闭（`ecp.lease.scan-enabled=false`），可配置打开或用管理接口手动触发。
 
 ---
@@ -200,7 +220,8 @@ READY ──► SUSPENDING ──► SUSPENDED ──► RESUMING ──► READ
   1. 清理孤立后端资源：所属环境不存在、已 `RELEASED` 或已 `SUSPENDED`
      （挂起环境不得持有计算资源，残留即泄漏）的资源删除；
   2. 收敛卡住/失败环境：`PENDING/PROVISIONING/FAILED/RELEASING` 清理残留并归还配额；
-     `SUSPENDING` 继续完成挂起；`RESUMING` 未到期则补齐资源恢复为 `READY`、
+     `SUSPENDING` 未到期则继续完成挂起、已到期则确定性转为回收；
+     `RESUMING` 未到期则补齐资源恢复为 `READY`、
      已到期则确定性转为回收；
   **`READY`（未过期）与 `SUSPENDED` 环境绝不动**（不误删、不误改有效环境）。
 - 扫描/收敛均受 `maxBatch`（条数）与 `maxMillis`（耗时）双上限约束，
@@ -277,6 +298,7 @@ mvn test -Dtest=QuotaConcurrencyTest     # 配额竞争（24 线程）与归还�
 mvn test -Dtest=AccessControlTest        # 越权/跨租户/密钥隔离（6）
 mvn test -Dtest=TemplateCompatibilityTest# 模板版本兼容（6）
 mvn test -Dtest=RenewExpiryConcurrencyTest  # 续期 vs 到期并发确定性（2）
+mvn test -Dtest=SuspendExpiryConcurrencyTest # 已过期未扫描挂起拒绝 + 挂起/回收并发确定性（4）
 mvn test -Dtest=SuspendResumeTest  # 挂起/恢复：幂等、配额让出与竞争、到期联动、失败收敛（13）
 mvn test -Dtest=ReconciliationTest       # 部分失败/孤立资源/有界扫描（6）
 mvn test -Dtest=AuditAndValidationTest   # 审计/参数/批量上限（5）
@@ -286,8 +308,12 @@ mvn test -Dtest=HttpApiIntegrationTest   # HTTP 全链路 RBAC/错误码/挂起�
 覆盖的关键需求映射：
 
 - 并发续期与回收 → `RenewExpiryConcurrencyTest`（到期前续期赢、到期后回收赢，各 8 线程竞争）
-- 挂起/恢复与到期并发 → `SuspendResumeTest.resumeAndExpiryRaceHasDeterministicOutcome` /
+- 挂起/恢复与到期并发 → `SuspendExpiryConcurrencyTest`（**已过期但扫描未到时挂起必须被拒绝
+  且环境已回收**；挂起与扫描 8 线程竞争：到期前挂起赢、到期后回收赢，回收恰好一次）与
+  `SuspendResumeTest.resumeAndExpiryRaceHasDeterministicOutcome` /
   `resumeBeforeExpiryWinsAgainstScanner`（8 线程竞争，结果确定且回收恰好一次）
+- 挂起到一半（SUSPENDING）期间到期 → `SuspendExpiryConcurrencyTest.suspendingEnvironmentExpiredIsReconciledToRelease`
+  （重启收敛确定性转为 RELEASED，资源与配额同时收敛、无半更新）
 - 挂起的配额让出与恢复竞争 → `SuspendResumeTest.suspendFreesQuotaForOthersAndResumeLosesContentionSafely`
 - 挂起不免回收/保留期上限 → `suspendedEnvironmentStillExpiresByLease` /
   `suspendedEnvironmentCollectedAfterMaxRetention`
@@ -305,4 +331,33 @@ mvn test -Dtest=HttpApiIntegrationTest   # HTTP 全链路 RBAC/错误码/挂起�
 
 `InMemoryResourceBackend` 提供：
 - `failAllocateRule(Predicate<AllocateContext>)`：按 (envId, 规格, 第几次尝试) 注入分配失败；
-- `failNextReleaseOnce()`：下一次释放先删部分资源再失败，制造 `RELEASING` 残留。
+- `failNextReleaseOnce()`：下一次释放先删部分资源再失败，制造 `RELEASING`/`SUSPENDING` 残留。
+
+### 本地手动复现「已过期但未扫描时挂起」
+
+自动复现见 `mvn test -Dtest=SuspendExpiryConcurrencyTest`；手工 HTTP 复现步骤：
+
+```bash
+# 1) 申请一个 1 秒后到期的环境（不触发自动扫描，或保持 ecp.lease.scan-enabled=false）
+curl -s -X POST localhost:8080/api/environments -H 'Content-Type: application/json' \
+  -H 'X-Subject: bob' -H 'X-Tenant: team-a' -H 'X-Role: OWNER' \
+  -d '{"tenantId":"team-a","name":"late","owner":"bob","templateVersion":"v2","ttlSeconds":1,
+       "resources":[{"kind":"service","image":"app:1.0","cpu":1,"memoryMb":256}],"configOverrides":{}}'
+
+# 2) 等待超过 1 秒但先不要调用 /api/admin/scan-expiries（模拟“已过期、扫描还没处理”）
+sleep 2
+
+# 3) 直接发起挂起 -> 必须是 409 INVALID_STATE，且消息说明已过期并已回收；
+#    绝不能返回 SUSPENDED 成功表示
+curl -s -i -X POST -H X-Subject:bob -H X-Tenant:team-a -H X-Role:OWNER \
+  'localhost:8080/api/environments/late/suspend?tenantId=team-a&reason=too-late'
+
+# 4) 再查/再扫：环境稳定停在 RELEASED，扫描不会重复回收
+curl -s -H X-Subject:bob -H X-Tenant:team-a -H X-Role:OWNER \
+  'localhost:8080/api/environments/late?tenantId=team-a'
+curl -s -X POST 'localhost:8080/api/admin/scan-expiries?maxBatch=50&maxMillis=200'
+```
+
+并发竞争（挂起 vs 到期回收）的确定性结论由 8 线程竞争测试固化：
+`suspendAndExpiryRaceBeforeDeadlineSuspensionWins`（未到期：挂起赢、扫描跳过）与
+`suspendAndExpiryRaceAfterDeadlineExpiryWins`（已到期：回收赢、挂起被拒、回收恰好一次）。

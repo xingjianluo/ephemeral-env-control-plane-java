@@ -321,24 +321,54 @@ public class EnvironmentService {
     /**
      * 挂起：READY -> SUSPENDING -> SUSPENDED。
      * 释放全部后端计算资源并归还配额（同租户其他环境可复用），
-     * 但保留环境身份、归属与已固化的配置快照；幂等：已 SUSPENDED 直接返回。
+     * 但保留环境身份、归属与已固化的配置快照；幂等：已 SUSPENDED 且仍有效时直接返回。
+     *
+     * 关键不变量（与续期/恢复一致）：到期判定与回收在同一租户临界区内完成。
+     * - READY 已到期 -> 先完成回收再以 INVALID_STATE 明确拒绝，绝不出现
+     *   “挂起成功、随后又被扫描回收”的自相矛盾结果；
+     * - 已 SUSPENDED 但已到期/超过最长保留 -> 同样先回收再拒绝（不返回一个注定被回收的表示）；
+     * - 未到期 -> 挂起成功；后到的扫描在锁内看到 SUSPENDED 且未到期，跳过，
+     *   此后该环境按其到期时间正常参与到期回收（挂起成立与被回收只有一个确定结果）。
      */
     public Environment suspend(Subject actor, String tenantId, String name, String reason) {
         synchronized (quotaService.lockFor(tenantId)) {
             Environment env = requireEnv(tenantId, name);
             accessControlService.require(actor, env, Permission.SUSPEND);
+            long ts = now();
+            if (env.getStatus() == EnvironmentStatus.READY) {
+                if (ts >= env.getExpiresAtMillis()) {
+                    // 与 renew/resume 完全一致：先把回收做完，再给出明确拒绝结论。
+                    releaseInternal(actor, env, "expired before suspend (at " + ts + ")", ActionType.EXPIRE);
+                    throw new InvalidStateException(
+                            "environment already expired and has been released: " + name);
+                }
+                return suspendInternal(actor, env, reason == null ? "manual suspend" : reason,
+                        ActionType.SUSPEND);
+            }
             if (env.getStatus() == EnvironmentStatus.SUSPENDED) {
+                // 已到期/保留超限的“重复挂起”同样不能返回成功假象：先回收再拒绝。
+                if (ts >= env.getExpiresAtMillis()) {
+                    releaseInternal(actor, env, "expired before suspend (at " + ts + ")",
+                            ActionType.EXPIRE);
+                    throw new InvalidStateException(
+                            "environment already expired and has been released: " + name);
+                }
+                long retentionMillis = properties.getSuspend().getMaxRetentionSeconds() * 1000L;
+                if (env.isSuspendedRetentionExceeded(ts, retentionMillis)) {
+                    releaseInternal(actor, env,
+                            "suspended retention exceeded before suspend (maxRetentionSeconds="
+                                    + properties.getSuspend().getMaxRetentionSeconds() + ")",
+                            ActionType.EXPIRE);
+                    throw new InvalidStateException(
+                            "suspended environment exceeded max retention and has been released: " + name);
+                }
                 // 幂等：重复挂起不报错、不重复释放资源/配额。
                 log.info("idempotent suspend actor={} env={} (already SUSPENDED)", actor.name(), name);
                 return env;
             }
-            if (env.getStatus() != EnvironmentStatus.READY) {
-                throw new InvalidStateException(
-                        "only READY environment can be suspended, current=" + env.getStatus()
-                                + " (env=" + name + ")");
-            }
-            return suspendInternal(actor, env, reason == null ? "manual suspend" : reason,
-                    ActionType.SUSPEND);
+            throw new InvalidStateException(
+                    "only READY environment can be suspended, current=" + env.getStatus()
+                            + " (env=" + name + ")");
         }
     }
 
@@ -507,7 +537,7 @@ public class EnvironmentService {
      * - PROVISIONING/FAILED：删除全部残留后端资源（幂等），确保配额归还，落 FAILED
      *   （失败中间态可查询，审计原因标明为收敛）；
      * - RELEASING：继续完成释放，成功则 RELEASED，仍失败则保持中间态等待下一轮；
-     * - SUSPENDING：继续完成挂起（释放残留资源、归还配额），成功则 SUSPENDED；
+     * - SUSPENDING：若已到期则确定性转为回收；否则继续完成挂起（释放残留资源、归还配额），成功则 SUSPENDED；
      * - RESUMING：若已过期则确定性转为回收；否则补齐缺失资源，成功则 READY；
      * - READY / SUSPENDED / RELEASED：不处理（READY 未过期与 SUSPENDED 都是有效稳定态，
      *   绝不动；过期交给扫描器，RELEASED 的孤立资源由收敛器第一阶段删除）。
@@ -577,6 +607,19 @@ public class EnvironmentService {
                     }
                 }
                 case SUSPENDING -> {
+                    // 挂起途中已到期：确定性地转为回收，不允许“挂起成功同时又被回收”。
+                    // 判定统一使用服务时钟（与续期/恢复/扫描一致），不使用调用方传入的时间。
+                    // releaseInternal 会继续释放残留资源，配额仅在资源全部释放后归还一次，
+                    // 不存在“资源已让出、配额还占着”或反过来的半更新。
+                    if (now() >= env.getExpiresAtMillis()) {
+                        try {
+                            releaseInternal(null, env,
+                                    "expired while SUSPENDING, reconciled to release", ActionType.EXPIRE);
+                            return true;
+                        } catch (ControlPlaneException e) {
+                            return false;
+                        }
+                    }
                     try {
                         suspendInternal(null, env, "reconcile stuck SUSPENDING", ActionType.RECONCILE);
                         return true;
