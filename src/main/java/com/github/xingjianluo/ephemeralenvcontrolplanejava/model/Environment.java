@@ -11,6 +11,8 @@ import java.util.Map;
  * 合法状态转换：
  * PENDING -> PROVISIONING -> READY | FAILED
  * READY|FAILED -> RELEASING -> RELEASED
+ * READY -> SUSPENDING -> SUSPENDED -> RESUMING -> READY
+ * RESUMING -> SUSPENDED（恢复失败回滚）；SUSPENDED -> RELEASING（挂起不免回收）
  * 任何跳变（例如 FAILED -> READY、RELEASED -> 其他）都会被拒绝。
  */
 public class Environment {
@@ -33,6 +35,8 @@ public class Environment {
     private Map<String, Object> configValues;
     private String secretValue;
     private boolean quotaReleased;
+    /** 进入挂起态的时刻（0 表示未挂起）；用于挂起保留期判定，恢复后清零。 */
+    private long suspendedAtMillis;
 
     private Environment(String id, String tenantId, String name, String owner,
                         String templateVersion, long now, long ttlMillis,
@@ -75,7 +79,11 @@ public class Environment {
         return switch (from) {
             case PENDING -> to == EnvironmentStatus.PROVISIONING;
             case PROVISIONING -> to == EnvironmentStatus.READY || to == EnvironmentStatus.FAILED;
-            case READY, FAILED -> to == EnvironmentStatus.RELEASING;
+            case READY -> to == EnvironmentStatus.RELEASING || to == EnvironmentStatus.SUSPENDING;
+            case FAILED -> to == EnvironmentStatus.RELEASING;
+            case SUSPENDING -> to == EnvironmentStatus.SUSPENDED;
+            case SUSPENDED -> to == EnvironmentStatus.RESUMING || to == EnvironmentStatus.RELEASING;
+            case RESUMING -> to == EnvironmentStatus.READY || to == EnvironmentStatus.SUSPENDED;
             case RELEASING -> to == EnvironmentStatus.RELEASED || to == EnvironmentStatus.FAILED;
             case RELEASED -> false;
         };
@@ -83,6 +91,17 @@ public class Environment {
 
     public boolean isExpired(long now) {
         return status == EnvironmentStatus.READY && now >= expiresAtMillis;
+    }
+
+    /** 挂起中的环境仍受原有效期约束：到期即应被清理（挂起不免回收）。 */
+    public boolean isSuspendedLeaseExpired(long now) {
+        return status == EnvironmentStatus.SUSPENDED && now >= expiresAtMillis;
+    }
+
+    /** 挂起保留期（防止挂起环境无界堆积）：超过 retentionMillis 即应被清理。 */
+    public boolean isSuspendedRetentionExceeded(long now, long retentionMillis) {
+        return status == EnvironmentStatus.SUSPENDED && suspendedAtMillis > 0
+                && now >= suspendedAtMillis + retentionMillis;
     }
 
     /** 续期：仅 READY 环境可续，基于“当前时间”重新计算到期，返回是否续期成功。 */
@@ -117,6 +136,7 @@ public class Environment {
     public Map<String, Object> getConfigValues() { return configValues; }
     public String getSecretValue() { return secretValue; }
     public boolean isQuotaReleased() { return quotaReleased; }
+    public long getSuspendedAtMillis() { return suspendedAtMillis; }
 
     public void setTemplateVersion(String templateVersion) { this.templateVersion = templateVersion; }
     public void setExpiresAtMillis(long expiresAtMillis) { this.expiresAtMillis = expiresAtMillis; }
@@ -125,4 +145,5 @@ public class Environment {
     public void setConfigValues(Map<String, Object> configValues) { this.configValues = configValues; }
     public void setSecretValue(String secretValue) { this.secretValue = secretValue; }
     public void setQuotaReleased(boolean quotaReleased) { this.quotaReleased = quotaReleased; }
+    public void setSuspendedAtMillis(long suspendedAtMillis) { this.suspendedAtMillis = suspendedAtMillis; }
 }

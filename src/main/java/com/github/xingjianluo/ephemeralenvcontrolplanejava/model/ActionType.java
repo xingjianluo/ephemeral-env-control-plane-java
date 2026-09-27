@@ -6,6 +6,8 @@ public enum ActionType {
     PROVISION,
     MARK_READY,
     RENEW,
+    SUSPEND,
+    RESUME,
     RELEASE,
     EXPIRE,
     RECONCILE,

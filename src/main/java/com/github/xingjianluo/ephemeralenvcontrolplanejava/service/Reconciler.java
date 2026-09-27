@@ -19,8 +19,10 @@ import java.util.Optional;
  * 阶段一（孤立资源）：分页遍历模拟后端资源；其所属环境不存在或已 RELEASED 时删除。
  * 环境仍处于 READY 且未过期 -> 绝不动（不得误删有效环境）。
  *
- * 阶段二（卡住环境）：PENDING/PROVISIONING/FAILED/RELEASING 的环境交给
- * EnvironmentService.recoverStuck 完成资源清理与配额归还；READY/RELEASED 跳过。
+ * 阶段二（卡住环境）：PENDING/PROVISIONING/FAILED/RELEASING/SUSPENDING/RESUMING
+ * 的环境交给 EnvironmentService.recoverStuck 完成资源清理与配额归还
+ * （SUSPENDING 继续挂起、RESUMING 回滚到 SUSPENDED）；SUSPENDED 仅清理崩溃
+ * 窗口的后端残留资源；READY/RELEASED 跳过。
  *
  * 超过预算立即停止并在报告中标记 truncatedByLimit，下轮继续，绝不无界执行。
  */

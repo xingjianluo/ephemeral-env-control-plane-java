@@ -1,7 +1,7 @@
 # 临时开发环境编排控制平面（本地模拟）
 
 一套可在**本地完全验证**的临时环境生命周期控制平面。后端资源用内存模拟器代替真实集群/云平台，
-不依赖任何外部服务或真实凭据；覆盖“申请 → 就绪 → 续期 → 回收”的完整生命周期，
+不依赖任何外部服务或真实凭据；覆盖“申请 → 就绪 → 续期 → 挂起/恢复 → 回收”的完整生命周期，
 并在并发、部分失败、模板版本演进取景下保持行为可预期。
 
 - Java 21 · Spring Boot 3.4 · 内存存储（ConcurrentMap）· JUnit 5 / Spring MockMvc
@@ -11,7 +11,7 @@
 ## 1. 快速开始
 
 ```bash
-# 构建并运行全部测试（39 个，含并发/失败收敛场景）
+# 构建并运行全部测试（53 个，含并发/失败收敛/挂起恢复场景）
 mvn test
 
 # 启动服务（默认写入演示数据）
@@ -58,6 +58,12 @@ curl -s -X POST localhost:8080/api/environments/demo/renew \
 curl -s -H X-Subject:bob -H X-Tenant:team-a -H X-Role:OWNER \
   -X DELETE 'localhost:8080/api/environments/demo?tenantId=team-a&reason=finished'
 
+# 挂起 / 恢复（均幂等；挂起让出计算资源与配额，恢复按固化快照重建）
+curl -s -X POST -H X-Subject:bob -H X-Tenant:team-a -H X-Role:OWNER \
+  'localhost:8080/api/environments/demo/suspend?tenantId=team-a'
+curl -s -X POST -H X-Subject:bob -H X-Tenant:team-a -H X-Role:OWNER \
+  'localhost:8080/api/environments/demo/resume?tenantId=team-a'
+
 # 手动触发到期扫描 / 重启后孤立资源收敛
 curl -s -X POST 'localhost:8080/api/admin/scan-expiries?maxBatch=50&maxMillis=200'
 curl -s -X POST 'localhost:8080/api/admin/reconcile?limit=50&maxMillis=200'
@@ -80,28 +86,57 @@ PENDING ──► PROVISIONING ──► READY
                 FAILED ──► RELEASING ──► RELEASED（终态）
                              ▲
                    READY ────┘
+
+READY ──► SUSPENDING ──► SUSPENDED ──► RESUMING ──► READY
+                              │            │
+                              │            └──► SUSPENDED（恢复失败/收敛回滚）
+                              └──► RELEASING ──► RELEASED（挂起不免回收）
 ```
 
-- 合法转换仅为：`PENDING→PROVISIONING→READY|FAILED`、`READY|FAILED→RELEASING→RELEASED`；
+- 合法转换仅为：`PENDING→PROVISIONING→READY|FAILED`、`READY|FAILED→RELEASING→RELEASED`、
+  `READY→SUSPENDING→SUSPENDED→RESUMING→READY`、`RESUMING→SUSPENDED`（恢复失败回滚）、
+  `SUSPENDED→RELEASING`（挂中到期/超保留期清理）；
   释放中途失败允许 `RELEASING→FAILED` 的回退判定路径以外，任何跳变（如 `FAILED→READY`、
   `RELEASED→任何`）都抛 `INVALID_STATE`。
 - **失败的环境永远不会被标记为 READY**，并保留可查询的 `failureReason`。
-- 续期不改变状态，只把到期时间推后；仅 `READY` 可续期。
+- 续期不改变状态，只把到期时间推后；仅 `READY` 可续期（挂起中须先恢复再续期）。
 
 ### 2.2 幂等
 
 - **申请**：同租户同名 + 同参数（owner/templateVersion/ttl/资源规格指纹一致）重复申请，
   返回同一个环境，不重复分配资源、不重复占配额；同名但参数不同 → `NAME_CONFLICT`。
 - **回收**：对已 `RELEASED` 的环境重复回收返回同一终态，不报错、不重复释放资源/配额。
+- **挂起**：对已 `SUSPENDED` 的环境重复挂起返回当前表示，不重复释放资源/配额。
+- **恢复**：对已 `READY` 的环境重复恢复返回当前表示，不重复占用配额/分配资源。
 
 ### 2.3 租约、到期与并发确定性
 
-- 每个环境有 `expiresAtMillis`；只有 `READY` 参与到期判定。
-- 同租户的所有写操作（申请/续期/回收/到期回收）都在同一把**租户锁**内串行。
+- 每个环境有 `expiresAtMillis`；`READY` 与 `SUSPENDED` 都参与到期判定（挂起不免回收）。
+- 同租户的所有写操作（申请/续期/挂起/恢复/回收/到期回收）都在同一把**租户锁**内串行。
 - “到期判定 + 回收”在锁内基于仓库最新状态完成：
   - 到期前发生续期 → 续期成功，后到的扫描看到新到期时间并跳过（**不会续完又被回收**）；
-  - 已到期发生续期 → 先完成回收，续期得到 `INVALID_STATE`，环境保持 `RELEASED`（**不会复活**）。
+  - 已到期发生续期 → 先完成回收，续期得到 `INVALID_STATE`，环境保持 `RELEASED`（**不会复活**）；
+  - 已到期发生挂起/恢复 → 同样先完成回收，挂起/恢复得到 `INVALID_STATE`（**回收赢**）；
+    恢复与到期扫描并发时，回收恰好发生一次，恢复方被明确拒绝，不出现半更新。
 - 到期扫描器默认关闭（`ecp.lease.scan-enabled=false`），可配置打开或用管理接口手动触发。
+
+### 2.4 挂起与恢复
+
+- **挂起（suspend）**：`READY` 环境可被挂起。挂起释放全部后端计算资源并归还配额
+  （CPU/内存/环境槽位立即被同租户其他环境复用），但环境本体仍然存在、可被有权者查到，
+  归属、身份与固化的配置快照全部保持不变。
+- **恢复（resume）**：按挂起前固化的资源规格重建后端资源，**不重新渲染模板**——
+  挂起之后注册的模板新版本不会追溯改变挂起前已固化的配置快照与模板版本。
+- **配额联动**：恢复需要重新占用配额；此刻配额若已被其他环境占满，恢复返回
+  `QUOTA_EXCEEDED`（HTTP 409）被明确拒绝，环境**稳定停在 SUSPENDED** 可稍后重试，
+  绝不部分恢复、不留幽灵占用。
+- **与有效期联动**：挂起不等于免回收——挂起中的环境仍受原 `expiresAtMillis` 约束，
+  到期被扫描器自动清理；另有可配置的挂起最长保留时间 `ecp.suspend.max-retention-ms`
+  （默认 24h），超时同样被清理，防止挂起环境无界堆积。
+- **失败与中间态**：挂起过程后端释放失败 → 停留可查询的 `SUSPENDING` 中间态
+  （配额仍持有，无半更新），由收敛器完成；恢复过程后端分配失败 → 回滚部分资源与配额，
+  稳定回到 `SUSPENDED`；进程崩溃卡在 `RESUMING` 的，重启收敛回滚到 `SUSPENDED` 并可重试。
+  收敛器对正常挂起的环境绝不动（不误删、不误改）。
 
 ---
 
@@ -112,7 +147,8 @@ PENDING ──► PROVISIONING ──► READY
 - **“配额检查 + 占用”与环境落库在同一个租户临界区内**，且配额预留先于 PENDING 记录落库：
   被拒绝的请求不会留下幽灵环境或幽灵占用；24 线程并发申请的测试证明不会超额分配。
 - 环境在以下时机恰好归还一次配额（`quotaReleased` 标记守卫）：
-  供应失败回滚、回收成功、重启收敛清理。销毁后槽位立即可被新申请使用。
+  供应失败回滚、**挂起成功**、恢复失败回滚、回收成功、重启收敛清理。
+  挂起/销毁后槽位立即可被新申请使用；恢复时重新占用配额，不足则明确拒绝。
 - 命名按 `租户 + 名称` 隔离：不同租户可使用相同名称；名称必须匹配 `[A-Za-z0-9._-]{1,64}`。
 
 ---
@@ -124,6 +160,7 @@ PENDING ──► PROVISIONING ──► READY
 | 查看环境非敏感信息 (`VIEW_ENV`) | 本租户任意 | 仅本人所有 | 本租户任意 |
 | 查看敏感配置 (`VIEW_SENSITIVE_CONFIG`) | 本租户任意 | 仅本人所有 | 禁止 |
 | 续期 (`RENEW`) / 回收 (`RELEASE`) | 本租户任意 | 仅本人所有 | 禁止 |
+| 挂起 (`SUSPEND`) / 恢复 (`RESUME`) | 本租户任意 | 仅本人所有 | 禁止 |
 
 - 跨租户请求一律 `FORBIDDEN`（通用文案 `access denied`，不暴露目标是否存在）。
 - 敏感值（模板的 secret 字段，演示中为 `dbPassword`）：
@@ -160,7 +197,8 @@ PENDING ──► PROVISIONING ──► READY
 - **收敛器（`POST /api/admin/reconcile`）两阶段**：
   1. 清理孤立后端资源：所属环境不存在或已 `RELEASED` 的资源删除；
   2. 收敛卡住/失败环境：`PENDING/PROVISIONING/FAILED/RELEASING` 清理残留并归还配额；
-  **`READY` 且未过期的环境绝不动**（不误删有效环境）。
+     `SUSPENDING` 继续完成挂起、`RESUMING` 回滚到 `SUSPENDED`、`SUSPENDED` 仅清理崩溃
+     窗口的后端残留；**`READY` 且未过期、正常 `SUSPENDED` 的环境绝不动**（不误删有效环境）。
 - 扫描/收敛均受 `maxBatch`（条数）与 `maxMillis`（耗时）双上限约束，
   超限即分页停止、下一轮继续；列表/审计查询受 `ecp.list-max-limit` 约束，
   超限返回 `BATCH_LIMIT`（HTTP 429），要求分页。审计存储带 10000 条硬上限，避免无界内存增长。
@@ -170,9 +208,10 @@ PENDING ──► PROVISIONING ──► READY
 ## 7. 审计
 
 每次状态变更追加一条审计记录：`actor / tenant / env / action / reason / before / after / time`，
-单调递增 id、倒序查询。动作包括 `APPLY, PROVISION, MARK_READY, RENEW, RELEASE, EXPIRE,
-RECONCILE, REJECT`。系统动作（扫描、收敛）的 actor 记为 `system`。异常链路通过错误码与
-日志（4xx 摘要、5xx 完整栈）区分，不被吞掉。
+单调递增 id、倒序查询。动作包括 `APPLY, PROVISION, MARK_READY, RENEW, SUSPEND, RESUME,
+RELEASE, EXPIRE, RECONCILE, REJECT`。系统动作（扫描、收敛）的 actor 记为 `system`。
+挂起、恢复以及挂起中的到期/保留期清理都会留下可查询的审计记录（触发主体、原因、前后状态）。
+异常链路通过错误码与日志（4xx 摘要、5xx 完整栈）区分，不被吞掉。
 
 ---
 
@@ -185,6 +224,8 @@ RECONCILE, REJECT`。系统动作（扫描、收敛）的 actor 记为 `system`�
 | `GET  /api/environments/{name}?tenantId=` | 查看非敏感视图 |
 | `GET  /api/environments/{name}/secret?tenantId=` | 读取敏感配置（需授权） |
 | `POST /api/environments/{name}/renew` | 续期 |
+| `POST /api/environments/{name}/suspend?tenantId=` | 挂起（幂等，让出计算资源与配额） |
+| `POST /api/environments/{name}/resume?tenantId=` | 恢复（幂等，重新占用配额，不足则 409 拒绝） |
 | `DELETE /api/environments/{name}?tenantId=&reason=` | 回收（幂等） |
 | `GET  /api/audit?envName=&limit=` | 审计查询（租户隔离） |
 | `POST /api/admin/quotas` / `GET /api/admin/quotas` | 设置/查看配额 |
@@ -216,6 +257,7 @@ RECONCILE, REJECT`。系统动作（扫描、收敛）的 actor 记为 `system`�
 | `ecp.lease.max-ttl-seconds` | 3600 | TTL 上限（超出拒绝） |
 | `ecp.scan.max-batch` | 50 | 扫描/收敛每轮处理条数上限 |
 | `ecp.scan.max-millis` | 200 | 扫描/收敛每轮耗时上限（毫秒） |
+| `ecp.suspend.max-retention-ms` | 86400000 | 挂起环境最长保留时间（超时自动清理，防无界堆积） |
 
 ---
 
@@ -231,6 +273,7 @@ mvn test -Dtest=QuotaConcurrencyTest     # 配额竞争（24 线程）与归还�
 mvn test -Dtest=AccessControlTest        # 越权/跨租户/密钥隔离（6）
 mvn test -Dtest=TemplateCompatibilityTest# 模板版本兼容（6）
 mvn test -Dtest=RenewExpiryConcurrencyTest  # 续期 vs 到期并发确定性（2）
+mvn test -Dtest=SuspendResumeTest  # 挂起/恢复：幂等、配额竞争、到期联动、越权、失败收敛（14）
 mvn test -Dtest=ReconciliationTest       # 部分失败/孤立资源/有界扫描（6）
 mvn test -Dtest=AuditAndValidationTest   # 审计/参数/批量上限（5）
 mvn test -Dtest=HttpApiIntegrationTest   # HTTP 全链路 RBAC/错误码（2）
@@ -239,6 +282,10 @@ mvn test -Dtest=HttpApiIntegrationTest   # HTTP 全链路 RBAC/错误码（2）
 覆盖的关键需求映射：
 
 - 并发续期与回收 → `RenewExpiryConcurrencyTest`（到期前续期赢、到期后回收赢，各 8 线程竞争）
+- 挂起/恢复幂等与配置快照稳定 → `SuspendResumeTest.suspendAndResumeAreIdempotentAndConfigStaysFrozen`
+- 挂起归还配额、恢复遇配额竞争被明确拒绝并可重试 → `SuspendResumeTest.suspendReturnsQuotaAndResumeLosesRaceStaysSuspended`
+- 挂起与到期/回收并发确定性、挂中到期与保留期清理 → `SuspendResumeTest`（race/scanner/retention 用例）
+- 挂起/恢复失败中间态与重启收敛 → `SuspendResumeTest`（SUSPENDING/RESUMING 收敛用例）
 - 配额竞争 → `QuotaConcurrencyTest.concurrentAppliesNeverExceedQuota`
 - 越权访问与敏感值不泄露 → `AccessControlTest`、`HttpApiIntegrationTest`
 - 模板版本不兼容 → `TemplateCompatibilityTest`

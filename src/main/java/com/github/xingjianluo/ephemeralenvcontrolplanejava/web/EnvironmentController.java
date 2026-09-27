@@ -62,6 +62,18 @@ public class EnvironmentController {
                 environmentService.renew(subject, request.getTenantId(), name, request.getTtlSeconds()));
     }
 
+    @PostMapping("/api/environments/{name}/suspend")
+    public EnvironmentResponse suspend(Subject subject, @PathVariable String name,
+                                       @RequestParam String tenantId) {
+        return EnvironmentResponse.of(environmentService.suspend(subject, tenantId, name));
+    }
+
+    @PostMapping("/api/environments/{name}/resume")
+    public EnvironmentResponse resume(Subject subject, @PathVariable String name,
+                                      @RequestParam String tenantId) {
+        return EnvironmentResponse.of(environmentService.resume(subject, tenantId, name));
+    }
+
     @DeleteMapping("/api/environments/{name}")
     public EnvironmentResponse release(Subject subject, @PathVariable String name,
                                        @RequestParam String tenantId,

@@ -19,6 +19,8 @@ import java.util.List;
  * 正确性：到期判定与回收动作在每个环境的租户锁内原子完成
  * （见 EnvironmentService.expireIfDue），与并发续期串行，
  * “续期成功”与“被回收”只有一个结果，不存在半更新。
+ * 覆盖范围：READY（租约到期）与 SUSPENDED（租约到期或挂起保留期超限）
+ * 的环境都会被扫描回收——挂起不免回收，也不无界堆积。
  */
 @Component
 public class LeaseExpiryScanner {
@@ -56,7 +58,8 @@ public class LeaseExpiryScanner {
                     break;
                 }
                 processed++;
-                if (env.getStatus() == EnvironmentStatus.READY
+                if ((env.getStatus() == EnvironmentStatus.READY
+                        || env.getStatus() == EnvironmentStatus.SUSPENDED)
                         && environmentService.expireIfDue(env)) {
                     expired++;
                 }
