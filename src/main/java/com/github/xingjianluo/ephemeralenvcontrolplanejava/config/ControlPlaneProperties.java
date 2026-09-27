@@ -12,6 +12,7 @@ public class ControlPlaneProperties {
     private int listMaxLimit = 100;
     private Lease lease = new Lease();
     private Scan scan = new Scan();
+    private Suspend suspend = new Suspend();
 
     public static class Lease {
         private boolean scanEnabled = false;
@@ -39,6 +40,16 @@ public class ControlPlaneProperties {
         public void setMaxMillis(long maxMillis) { this.maxMillis = maxMillis; }
     }
 
+    /** 挂起策略：挂起环境的最长保留时间（防止无界堆积），到期由扫描器清理。 */
+    public static class Suspend {
+        private long maxRetentionSeconds = 86400;
+
+        public long getMaxRetentionSeconds() { return maxRetentionSeconds; }
+        public void setMaxRetentionSeconds(long maxRetentionSeconds) {
+            this.maxRetentionSeconds = maxRetentionSeconds;
+        }
+    }
+
     public boolean isBootstrapDemo() { return bootstrapDemo; }
     public void setBootstrapDemo(boolean bootstrapDemo) { this.bootstrapDemo = bootstrapDemo; }
     public int getListMaxLimit() { return listMaxLimit; }
@@ -47,4 +58,6 @@ public class ControlPlaneProperties {
     public void setLease(Lease lease) { this.lease = lease; }
     public Scan getScan() { return scan; }
     public void setScan(Scan scan) { this.scan = scan; }
+    public Suspend getSuspend() { return suspend; }
+    public void setSuspend(Suspend suspend) { this.suspend = suspend; }
 }

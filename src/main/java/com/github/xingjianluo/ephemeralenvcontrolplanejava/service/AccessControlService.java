@@ -16,7 +16,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * 权限矩阵（跨租户一律拒绝）：
  * - VIEW_ENV：TENANT_ADMIN 任意环境；OWNER 仅本人环境；VIEWER 可读本租户环境；
- * - VIEW_SENSITIVE_CONFIG / RENEW / RELEASE：TENANT_ADMIN 任意；OWNER 仅本人；VIEWER 禁止。
+ * - VIEW_SENSITIVE_CONFIG / RENEW / SUSPEND / RESUME / RELEASE：
+ *   TENANT_ADMIN 任意；OWNER 仅本人；VIEWER 禁止。
  *
  * 越权异常只给通用说明，不携带环境是否存在等内部细节（不存在由调用方在鉴权前
  * 以 NOT_FOUND 回应，避免通过错误差异探测他租户资源）。
@@ -79,7 +80,7 @@ public class AccessControlService {
                 case TENANT_ADMIN, VIEWER -> true;
                 case OWNER -> env.getOwner().equals(subject.name());
             };
-            case VIEW_SENSITIVE_CONFIG, RENEW, RELEASE -> switch (subject.role()) {
+            case VIEW_SENSITIVE_CONFIG, RENEW, SUSPEND, RESUME, RELEASE -> switch (subject.role()) {
                 case TENANT_ADMIN -> true;
                 case OWNER -> env.getOwner().equals(subject.name());
                 case VIEWER -> false;

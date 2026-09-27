@@ -16,11 +16,13 @@ import java.util.Optional;
 /**
  * 重启后的安全收敛器，两阶段且受 limit/maxMillis 双上限约束：
  *
- * 阶段一（孤立资源）：分页遍历模拟后端资源；其所属环境不存在或已 RELEASED 时删除。
+ * 阶段一（孤立资源）：分页遍历模拟后端资源；其所属环境不存在、已 RELEASED
+ * 或已 SUSPENDED（挂起环境不得持有计算资源，残留即泄漏）时删除。
  * 环境仍处于 READY 且未过期 -> 绝不动（不得误删有效环境）。
  *
- * 阶段二（卡住环境）：PENDING/PROVISIONING/FAILED/RELEASING 的环境交给
- * EnvironmentService.recoverStuck 完成资源清理与配额归还；READY/RELEASED 跳过。
+ * 阶段二（卡住环境）：PENDING/PROVISIONING/FAILED/RELEASING/SUSPENDING/RESUMING
+ * 的环境交给 EnvironmentService.recoverStuck 完成资源清理/重建与配额归还；
+ * READY/SUSPENDED/RELEASED 跳过（SUSPENDED 是有效稳定态，绝不误改）。
  *
  * 超过预算立即停止并在报告中标记 truncatedByLimit，下轮继续，绝不无界执行。
  */
@@ -66,7 +68,10 @@ public class Reconciler {
                 }
                 budget--;
                 Optional<Environment> owner = repository.findById(r.envId());
-                boolean orphan = owner.isEmpty() || owner.get().getStatus() == EnvironmentStatus.RELEASED;
+                // 挂起环境必须已让出全部计算资源：其名下残留资源按孤立资源清理。
+                boolean orphan = owner.isEmpty()
+                        || owner.get().getStatus() == EnvironmentStatus.RELEASED
+                        || owner.get().getStatus() == EnvironmentStatus.SUSPENDED;
                 if (orphan) {
                     try {
                         if (backend.release(r.resourceId())) {
@@ -107,7 +112,8 @@ public class Reconciler {
                 }
                 budget--;
                 EnvironmentStatus st = env.getStatus();
-                if (st == EnvironmentStatus.READY || st == EnvironmentStatus.RELEASED) {
+                if (st == EnvironmentStatus.READY || st == EnvironmentStatus.RELEASED
+                        || st == EnvironmentStatus.SUSPENDED) {
                     continue;
                 }
                 if (!environmentService.recoverStuck(env, now)) {

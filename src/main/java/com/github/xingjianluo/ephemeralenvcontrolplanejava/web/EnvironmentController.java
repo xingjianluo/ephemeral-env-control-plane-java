@@ -62,6 +62,23 @@ public class EnvironmentController {
                 environmentService.renew(subject, request.getTenantId(), name, request.getTtlSeconds()));
     }
 
+    @PostMapping("/api/environments/{name}/suspend")
+    public EnvironmentResponse suspend(Subject subject, @PathVariable String name,
+                                       @RequestParam String tenantId,
+                                       @RequestParam(required = false) String reason) {
+        // 幂等语义：重复挂起返回同一环境的当前表示（统一 200）。
+        return EnvironmentResponse.of(
+                environmentService.suspend(subject, tenantId, name, reason));
+    }
+
+    @PostMapping("/api/environments/{name}/resume")
+    public EnvironmentResponse resume(Subject subject, @PathVariable String name,
+                                      @RequestParam String tenantId) {
+        // 配额不足/已到期时以 409 明确拒绝，环境稳定停在 SUSPENDED/被回收，无部分恢复。
+        return EnvironmentResponse.of(
+                environmentService.resume(subject, tenantId, name));
+    }
+
     @DeleteMapping("/api/environments/{name}")
     public EnvironmentResponse release(Subject subject, @PathVariable String name,
                                        @RequestParam String tenantId,

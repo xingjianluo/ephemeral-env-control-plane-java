@@ -118,6 +118,78 @@ class HttpApiIntegrationTest {
     }
 
     @Test
+    void suspendResumeOverHttp() throws Exception {
+        String body = applyBody("team-a", "web-suspend", "bob", "v2", 300L, 1, 256,
+                Map.of("dbPassword", "db-pw"));
+        mvc.perform(post("/api/environments")
+                        .header("X-Subject", "bob").header("X-Tenant", "team-a").header("X-Role", "OWNER")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("READY"));
+
+        // 1) carol(VIEWER) 挂起 -> 403。
+        mvc.perform(post("/api/environments/web-suspend/suspend?tenantId=team-a")
+                        .header("X-Subject", "carol").header("X-Tenant", "team-a").header("X-Role", "VIEWER"))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error").value("FORBIDDEN"));
+
+        // 2) bob 挂起 -> 200 SUSPENDED；身份与配置快照仍可见，敏感字段掩码。
+        mvc.perform(post("/api/environments/web-suspend/suspend?tenantId=team-a&reason=idle")
+                        .header("X-Subject", "bob").header("X-Tenant", "team-a").header("X-Role", "OWNER"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("SUSPENDED"))
+                .andExpect(jsonPath("$.owner").value("bob"))
+                .andExpect(jsonPath("$.suspendedAtMillis").exists())
+                .andExpect(jsonPath("$.config.dbPassword").value("***"));
+
+        // 3) 重复挂起幂等；配额已让出（usedEnvs=0）。
+        mvc.perform(post("/api/environments/web-suspend/suspend?tenantId=team-a")
+                        .header("X-Subject", "bob").header("X-Tenant", "team-a").header("X-Role", "OWNER"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("SUSPENDED"));
+        mvc.perform(get("/api/admin/quotas?tenantId=team-a")
+                        .header("X-Subject", "alice").header("X-Tenant", "team-a").header("X-Role", "TENANT_ADMIN"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.usedEnvs").value(0))
+                .andExpect(jsonPath("$.usedCpu").value(0));
+
+        // 4) 挂起中读取密钥 -> 409（仅 READY 可取密钥），响应不含真实密钥。
+        mvc.perform(get("/api/environments/web-suspend/secret?tenantId=team-a")
+                        .header("X-Subject", "bob").header("X-Tenant", "team-a").header("X-Role", "OWNER"))
+                .andExpect(status().isConflict())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("db-pw"))));
+
+        // 5) carol 恢复 -> 403；bob 恢复 -> 200 READY，配置快照保持挂起前。
+        mvc.perform(post("/api/environments/web-suspend/resume?tenantId=team-a")
+                        .header("X-Subject", "carol").header("X-Tenant", "team-a").header("X-Role", "VIEWER"))
+                .andExpect(status().isForbidden());
+        mvc.perform(post("/api/environments/web-suspend/resume?tenantId=team-a")
+                        .header("X-Subject", "bob").header("X-Tenant", "team-a").header("X-Role", "OWNER"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("READY"))
+                .andExpect(jsonPath("$.templateVersion").value("v2"))
+                .andExpect(jsonPath("$.config.dbPassword").value("***"));
+
+        // 6) 重复恢复幂等；配额重新占用恰好一次。
+        mvc.perform(post("/api/environments/web-suspend/resume?tenantId=team-a")
+                        .header("X-Subject", "bob").header("X-Tenant", "team-a").header("X-Role", "OWNER"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("READY"));
+        mvc.perform(get("/api/admin/quotas?tenantId=team-a")
+                        .header("X-Subject", "alice").header("X-Tenant", "team-a").header("X-Role", "TENANT_ADMIN"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.usedEnvs").value(1))
+                .andExpect(jsonPath("$.usedCpu").value(1));
+
+        // 7) 恢复后密钥可再次读取。
+        mvc.perform(get("/api/environments/web-suspend/secret?tenantId=team-a")
+                        .header("X-Subject", "bob").header("X-Tenant", "team-a").header("X-Role", "OWNER"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.secret").value("db-pw"));
+    }
+
+    @Test
     void quotaAndTemplateErrorsAreDistinguishableOverHttp() throws Exception {
         // 抬高环境数上限，使本轮专门压测 CPU 维度（maxCpu=4）的拒绝原因。
         mvc.perform(post("/api/admin/quotas?tenantId=team-a&maxEnvs=10&maxCpu=4&maxMemoryMb=4096")

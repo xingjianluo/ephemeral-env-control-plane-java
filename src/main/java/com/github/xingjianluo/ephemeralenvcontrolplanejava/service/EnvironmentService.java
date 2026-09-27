@@ -316,6 +316,169 @@ public class EnvironmentService {
         }
     }
 
+    // ---------------------------------------------------------------- 挂起 / 恢复
+
+    /**
+     * 挂起：READY -> SUSPENDING -> SUSPENDED。
+     * 释放全部后端计算资源并归还配额（同租户其他环境可复用），
+     * 但保留环境身份、归属与已固化的配置快照；幂等：已 SUSPENDED 直接返回。
+     */
+    public Environment suspend(Subject actor, String tenantId, String name, String reason) {
+        synchronized (quotaService.lockFor(tenantId)) {
+            Environment env = requireEnv(tenantId, name);
+            accessControlService.require(actor, env, Permission.SUSPEND);
+            if (env.getStatus() == EnvironmentStatus.SUSPENDED) {
+                // 幂等：重复挂起不报错、不重复释放资源/配额。
+                log.info("idempotent suspend actor={} env={} (already SUSPENDED)", actor.name(), name);
+                return env;
+            }
+            if (env.getStatus() != EnvironmentStatus.READY) {
+                throw new InvalidStateException(
+                        "only READY environment can be suspended, current=" + env.getStatus()
+                                + " (env=" + name + ")");
+            }
+            return suspendInternal(actor, env, reason == null ? "manual suspend" : reason,
+                    ActionType.SUSPEND);
+        }
+    }
+
+    /**
+     * 恢复：SUSPENDED -> RESUMING -> READY。
+     * 在租户锁内先做确定性判定：已到期/保留超限 -> 先完成回收再明确拒绝；
+     * 配额不足 -> 明确拒绝且环境稳定停在 SUSPENDED（无部分恢复，可重试）；
+     * 配置快照与模板版本沿用挂起前固化值，新版本模板不追溯影响。
+     * 幂等：已 READY 直接返回。
+     */
+    public Environment resume(Subject actor, String tenantId, String name) {
+        synchronized (quotaService.lockFor(tenantId)) {
+            Environment env = requireEnv(tenantId, name);
+            accessControlService.require(actor, env, Permission.RESUME);
+            if (env.getStatus() == EnvironmentStatus.READY) {
+                // 幂等：重复恢复不报错、不重复占用配额/资源。
+                log.info("idempotent resume actor={} env={} (already READY)", actor.name(), name);
+                return env;
+            }
+            if (env.getStatus() != EnvironmentStatus.SUSPENDED) {
+                throw new InvalidStateException(
+                        "only SUSPENDED environment can be resumed, current=" + env.getStatus()
+                                + " (env=" + name + ")");
+            }
+            long ts = now();
+            // 关键不变量：恢复与回收只能有一个确定结果。到期判定与回收在同一临界区，
+            // 先完成回收再拒绝恢复，绝不出现“恢复成功同时又被回收”。
+            if (ts >= env.getExpiresAtMillis()) {
+                releaseInternal(actor, env, "expired before resume (at " + ts + ")", ActionType.EXPIRE);
+                throw new InvalidStateException(
+                        "environment already expired and has been released: " + name);
+            }
+            long retentionMillis = properties.getSuspend().getMaxRetentionSeconds() * 1000L;
+            if (env.isSuspendedRetentionExceeded(ts, retentionMillis)) {
+                releaseInternal(actor, env,
+                        "suspended retention exceeded before resume (maxRetentionSeconds="
+                                + properties.getSuspend().getMaxRetentionSeconds() + ")",
+                        ActionType.EXPIRE);
+                throw new InvalidStateException(
+                        "suspended environment exceeded max retention and has been released: " + name);
+            }
+            // 重新占用配额：不足则配额异常抛出，环境未做任何变更，稳定停在 SUSPENDED。
+            quotaService.reserve(tenantId, env.getTotalCpu(), env.getTotalMemoryMb());
+            env.setQuotaReleased(false);
+            // 后端失败时停留 RESUMING 中间态（配额已占、资源部分在建，状态一致可查），
+            // 由收敛器继续推进；此处不归还配额，避免“资源在但配额未占”的反向半更新。
+            return resumeInternal(actor, env, ActionType.RESUME);
+        }
+    }
+
+    /**
+     * 调用方必须持有租户锁。释放全部后端资源成功后归还配额并进入 SUSPENDED；
+     * 后端失败则停留 SUSPENDING 中间态（配额仍占用、残留资源可查），等待收敛重试。
+     */
+    Environment suspendInternal(Subject actor, Environment env, String reason, ActionType action) {
+        EnvironmentStatus before = env.getStatus();
+        if (before != EnvironmentStatus.SUSPENDING) {
+            env.transitionTo(EnvironmentStatus.SUSPENDING);
+            repository.save(env);
+            auditService.record(actor, env, action, reason, before, EnvironmentStatus.SUSPENDING);
+        }
+        int deleted;
+        try {
+            deleted = backend.releaseAll(env.getId());
+            for (String rid : env.getResourceIds()) {
+                try {
+                    if (backend.release(rid)) {
+                        deleted++;
+                    }
+                } catch (ControlPlaneException e) {
+                    env.setFailureReason(e.getMessage());
+                    repository.save(env);
+                    throw e;
+                }
+            }
+        } catch (ControlPlaneException e) {
+            env.setFailureReason(e.getMessage());
+            repository.save(env); // SUSPENDING 残留：可查询的中间态，绝不留成功假象
+            auditService.record(actor, env, action,
+                    "suspend incomplete, awaiting reconciliation: " + e.getMessage(),
+                    EnvironmentStatus.SUSPENDING, EnvironmentStatus.SUSPENDING);
+            throw e;
+        }
+        env.setResourceIds(List.of());
+        releaseQuotaOnce(env); // 计算配额让出给同租户其他环境
+        env.setFailureReason(null);
+        env.setSuspendedAtMillis(now());
+        env.transitionTo(EnvironmentStatus.SUSPENDED);
+        repository.save(env);
+        auditService.record(actor, env, action,
+                reason + " (resources released=" + deleted + ", quota returned)",
+                EnvironmentStatus.SUSPENDING, EnvironmentStatus.SUSPENDED);
+        return env;
+    }
+
+    /**
+     * 调用方必须持有租户锁且配额已重新占用。按挂起前固化的资源规格重建后端资源
+     * （不重新渲染模板：配置快照与模板版本保持挂起前状态）；失败停留 RESUMING。
+     */
+    Environment resumeInternal(Subject actor, Environment env, ActionType action) {
+        EnvironmentStatus before = env.getStatus();
+        if (before != EnvironmentStatus.RESUMING) {
+            env.transitionTo(EnvironmentStatus.RESUMING);
+            repository.save(env);
+            auditService.record(actor, env, action,
+                    "resume: quota re-reserved, rebuilding resources",
+                    before, EnvironmentStatus.RESUMING);
+        }
+        try {
+            allocateMissing(env);
+        } catch (ControlPlaneException e) {
+            env.setFailureReason(e.getMessage());
+            repository.save(env); // RESUMING 残留：可查询的中间态
+            auditService.record(actor, env, action,
+                    "resume incomplete, awaiting reconciliation: " + e.getMessage(),
+                    EnvironmentStatus.RESUMING, EnvironmentStatus.RESUMING);
+            throw e;
+        }
+        env.setFailureReason(null);
+        env.setSuspendedAtMillis(0);
+        env.transitionTo(EnvironmentStatus.READY);
+        repository.save(env);
+        auditService.record(actor, env, action,
+                "resumed with pinned config snapshot (templateVersion=" + env.getTemplateVersion() + ")",
+                EnvironmentStatus.RESUMING, EnvironmentStatus.READY);
+        return env;
+    }
+
+    /** 逐个补齐缺失的后端资源（按 resourceIds 数量判定进度，幂等可重入）。 */
+    private void allocateMissing(Environment env) {
+        List<String> allocated = new ArrayList<>(env.getResourceIds());
+        List<ResourceSpec> specs = env.getSpecs();
+        while (allocated.size() < specs.size()) {
+            ResourceSpec spec = specs.get(allocated.size());
+            allocated.add(backend.allocate(env.getId(), spec).resourceId());
+            env.setResourceIds(List.copyOf(allocated));
+            repository.save(env);
+        }
+    }
+
     // ---------------------------------------------------------------- 回收
 
     public Environment release(Subject actor, String tenantId, String name, String reason) {
@@ -344,8 +507,10 @@ public class EnvironmentService {
      * - PROVISIONING/FAILED：删除全部残留后端资源（幂等），确保配额归还，落 FAILED
      *   （失败中间态可查询，审计原因标明为收敛）；
      * - RELEASING：继续完成释放，成功则 RELEASED，仍失败则保持中间态等待下一轮；
-     * - READY（含已过期）、RELEASED：不处理（READY 且未过期绝不动；过期交给扫描器，
-     *   RELEASED 的孤立资源由收敛器第一阶段删除）。
+     * - SUSPENDING：继续完成挂起（释放残留资源、归还配额），成功则 SUSPENDED；
+     * - RESUMING：若已过期则确定性转为回收；否则补齐缺失资源，成功则 READY；
+     * - READY / SUSPENDED / RELEASED：不处理（READY 未过期与 SUSPENDED 都是有效稳定态，
+     *   绝不动；过期交给扫描器，RELEASED 的孤立资源由收敛器第一阶段删除）。
      *
      * @return true 表示本轮已安全收敛；false 表示后端仍失败，需下一轮继续。
      */
@@ -411,8 +576,35 @@ public class EnvironmentService {
                         return false;
                     }
                 }
+                case SUSPENDING -> {
+                    try {
+                        suspendInternal(null, env, "reconcile stuck SUSPENDING", ActionType.RECONCILE);
+                        return true;
+                    } catch (ControlPlaneException e) {
+                        return false;
+                    }
+                }
+                case RESUMING -> {
+                    // 恢复途中已到期：确定性地转为回收，不允许“恢复成功同时又被回收”。
+                    // 判定统一使用服务时钟（与续期/扫描一致），不使用调用方传入的时间。
+                    if (now() >= env.getExpiresAtMillis()) {
+                        try {
+                            releaseInternal(null, env,
+                                    "expired while RESUMING, reconciled to release", ActionType.EXPIRE);
+                            return true;
+                        } catch (ControlPlaneException e) {
+                            return false;
+                        }
+                    }
+                    try {
+                        resumeInternal(null, env, ActionType.RECONCILE);
+                        return true;
+                    } catch (ControlPlaneException e) {
+                        return false;
+                    }
+                }
                 default -> {
-                    return true; // READY / RELEASED 不动
+                    return true; // READY / SUSPENDED / RELEASED 不动
                 }
             }
         }
@@ -420,25 +612,38 @@ public class EnvironmentService {
 
     /**
      * 到期判定 + 回收的原子步骤（调用方在租户锁内，本方法再加租户锁为可重入同一监视器）。
-     * 必须从仓库重新读取环境，确保看到并发续期的最新到期时间：
+     * 必须从仓库重新读取环境，确保看到并发续期/恢复的最新状态：
      * 扫描器遍历的是快照，真正判定以锁内最新状态为准。
+     * 覆盖 READY 与 SUSPENDED：挂起不免回收；SUSPENDED 还受最长保留时间约束。
      *
-     * @return true 表示本次完成回收；false 表示未到期或已被并发续期/回收。
+     * @return true 表示本次完成回收；false 表示未到期或已被并发续期/恢复/回收。
      */
     public boolean expireIfDue(Environment snapshot) {
         synchronized (quotaService.lockFor(snapshot.getTenantId())) {
             Environment fresh = repository.findById(snapshot.getId()).orElse(null);
-            if (fresh == null || fresh.isFinal() || fresh.getStatus() != EnvironmentStatus.READY) {
+            if (fresh == null || fresh.isFinal()) {
+                return false;
+            }
+            EnvironmentStatus st = fresh.getStatus();
+            if (st != EnvironmentStatus.READY && st != EnvironmentStatus.SUSPENDED) {
                 return false;
             }
             long ts = now();
-            if (ts < fresh.getExpiresAtMillis()) {
-                // 已被并发续期：绝不能回收（确定性结果：续期赢，扫描跳过）。
+            String reason;
+            if (ts >= fresh.getExpiresAtMillis()) {
+                reason = "lease expired at " + fresh.getExpiresAtMillis()
+                        + (st == EnvironmentStatus.SUSPENDED ? " (while SUSPENDED)" : "");
+            } else if (st == EnvironmentStatus.SUSPENDED
+                    && fresh.isSuspendedRetentionExceeded(ts,
+                            properties.getSuspend().getMaxRetentionSeconds() * 1000L)) {
+                reason = "suspended retention exceeded (suspendedAt=" + fresh.getSuspendedAtMillis()
+                        + ", maxRetentionSeconds=" + properties.getSuspend().getMaxRetentionSeconds() + ")";
+            } else {
+                // 已被并发续期/恢复：绝不能回收（确定性结果：续期/恢复赢，扫描跳过）。
                 return false;
             }
             try {
-                releaseInternal(null, fresh, "lease expired at " + fresh.getExpiresAtMillis(),
-                        ActionType.EXPIRE);
+                releaseInternal(null, fresh, reason, ActionType.EXPIRE);
             } catch (ControlPlaneException e) {
                 // RELEASING 中间态已落库，下一轮扫描/收敛继续，绝不返回成功假象。
                 log.warn("expire release incomplete env={}: {}", fresh.getName(), e.getMessage());
