@@ -19,8 +19,11 @@ import java.util.List;
  * 有界性：每轮最多处理 maxBatch 个环境、总耗时不超过 maxMillis；
  * 超过任一上限即停止本轮（分页推进），由下一轮继续，绝不无界占用内存或线程。
  * 正确性：到期判定与回收动作在每个环境的租户锁内原子完成
- * （见 EnvironmentService.expireIfDue），与并发续期/恢复串行，
- * “续期/恢复成功”与“被回收”只有一个结果，不存在半更新。
+ * （见 EnvironmentService.expireIfDue），与并发续期/挂起/恢复串行，
+ * “续期/挂起/恢复成功”与“被回收”只有一个结果，不存在半更新。
+ * 特别地：对已过期但尚未被本扫描器处理的 READY 环境发起挂起时，
+ * 由挂起请求线程在同一临界区内完成回收并明确拒绝（见 EnvironmentService.suspend），
+ * 不会返回“挂起成功、随后又被本扫描器回收”。
  */
 @Component
 public class LeaseExpiryScanner {

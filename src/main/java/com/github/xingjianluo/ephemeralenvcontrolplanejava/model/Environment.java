@@ -12,6 +12,7 @@ import java.util.Map;
  * PENDING -> PROVISIONING -> READY | FAILED
  * READY -> SUSPENDING -> SUSPENDED -> RESUMING -> READY
  * READY|SUSPENDED|FAILED -> RELEASING -> RELEASED
+ * SUSPENDING|RESUMING -> RELEASING -> RELEASED（中间态期间到期/保留超限，确定性回收）
  * 任何跳变（例如 FAILED -> READY、RELEASED -> 其他）都会被拒绝。
  */
 public class Environment {

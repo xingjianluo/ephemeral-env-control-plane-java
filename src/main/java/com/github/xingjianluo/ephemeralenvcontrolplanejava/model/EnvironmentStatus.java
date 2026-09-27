@@ -7,6 +7,7 @@ package com.github.xingjianluo.ephemeralenvcontrolplanejava.model;
  * READY -> SUSPENDING -> SUSPENDED（挂起：释放计算资源与配额，保留身份与配置快照）
  * SUSPENDED -> RESUMING -> READY（恢复：重新占用配额并重建资源）
  * SUSPENDED -> RELEASING -> RELEASED（挂起中仍受有效期/最长保留约束，到期照常被回收）
+ * SUSPENDING|RESUMING -> RELEASING -> RELEASED（中间态期间到期：请求临界区或收敛确定性回收）
  * FAILED -> RELEASING -> RELEASED（回收部分资源并归还配额）
  * SUSPENDING / RESUMING 为可查询的中间态，底层失败时停留于此，由收敛器推进。
  * RELEASED 为终态，回收幂等。
